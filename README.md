@@ -1,16 +1,67 @@
-# college_bus_app
+# 🚍 Realtime Bus Tracking System
 
-A new Flutter project.
+A Flutter-based mobile application that enables **live bus tracking** and **QR-based attendance system** for students.
 
-## Getting Started
+---
 
-This project is a starting point for a Flutter application.
+## 📌 Features
 
-A few resources to get you started if this is your first Flutter project:
+* 📍 Real-time bus location tracking using GPS
+* 📷 QR code-based attendance system
+* 🔐 Firebase Authentication (Student / Driver login)
+* ☁️ Firebase Realtime Database integration
+* 🧭 Live map updates
+* 🚦 Trip start/stop functionality for drivers
 
-- [Lab: Write your first Flutter app](https://docs.flutter.dev/get-started/codelab)
-- [Cookbook: Useful Flutter samples](https://docs.flutter.dev/cookbook)
+---
 
-For help getting started with Flutter development, view the
-[online documentation](https://docs.flutter.dev/), which offers tutorials,
-samples, guidance on mobile development, and a full API reference.
+## 🛠 Tech Stack
+
+* **Flutter** (UI Development)
+* **Firebase Authentication**
+* **Firebase Realtime Database**
+* **Google Maps API**
+* **Geolocator (GPS tracking)**
+
+---
+
+## 📱 App Modules
+
+### 👨‍🎓 Student
+
+* Login with credentials
+* Scan QR code for attendance
+* View live bus location
+
+### 🧑‍✈️ Driver
+
+* Start / Stop trip
+* Share live location
+* Generate QR for attendance
+
+---
+
+## 🚀 How to Run the Project
+
+```bash
+git clone https://github.com/anrxg/RealtimeVehiclesTracking.git
+cd RealtimeVehiclesTracking
+flutter pub get
+flutter run
+```
+
+---
+
+## 🔮 Future Improvements
+
+* Push notifications for bus arrival
+* Admin dashboard
+* Multiple bus tracking
+* Offline support
+
+---
+
+## 👨‍💻 Author
+
+**Anurag Shukla**
+GitHub: https://github.com/anrxg

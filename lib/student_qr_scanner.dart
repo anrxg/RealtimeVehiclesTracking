@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:mobile_scanner/mobile_scanner.dart';
+import 'package:firebase_auth/firebase_auth.dart';
 import 'package:firebase_database/firebase_database.dart';
 
 class StudentQRScanner extends StatefulWidget {
@@ -10,22 +11,27 @@ class StudentQRScanner extends StatefulWidget {
 }
 
 class _StudentQRScannerState extends State<StudentQRScanner> {
-  final DatabaseReference attendanceRef = FirebaseDatabase.instance.ref(
-    "attendance",
-  );
-
   bool scanned = false;
 
-  void saveAttendance(String tripId) {
-    attendanceRef.push().set({
-      "studentId": "student1",
+  Future<void> markAttendance(String tripId) async {
+    final user = FirebaseAuth.instance.currentUser;
+    if (user == null) return;
+
+    String studentId = user.uid;
+
+    await FirebaseDatabase.instance.ref("attendance").push().set({
+      "studentId": studentId,
       "tripId": tripId,
-      "time": DateTime.now().toString(),
+      "time": DateTime.now().toIso8601String(),
     });
 
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(content: Text("Attendance Marked Successfully")),
-    );
+    if (!mounted) return;
+
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(const SnackBar(content: Text("✅ Attendance Marked")));
+
+    Navigator.pop(context);
   }
 
   @override
@@ -43,11 +49,7 @@ class _StudentQRScannerState extends State<StudentQRScanner> {
 
             if (code != null) {
               scanned = true;
-
-              saveAttendance(code);
-
-              Navigator.pop(context);
-
+              markAttendance(code);
               break;
             }
           }

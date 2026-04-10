@@ -5,13 +5,52 @@ import 'package:google_maps_flutter/google_maps_flutter.dart';
 import 'package:firebase_core/firebase_core.dart';
 import 'package:firebase_database/firebase_database.dart';
 import 'driver_qr_screen.dart';
-import 'student_qr_scanner.dart';
 import 'package:flutter_background_service/flutter_background_service.dart';
+import 'auth_service.dart';
+import 'package:firebase_auth/firebase_auth.dart';
+import 'student_qr_scanner.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await Firebase.initializeApp();
+
+  await FlutterBackgroundService().configure(
+    androidConfiguration: AndroidConfiguration(
+      onStart: onStart,
+      isForegroundMode: true,
+    ),
+    iosConfiguration: IosConfiguration(
+      onForeground: onStart,
+      onBackground: (service) async {
+        return true;
+      },
+    ),
+  );
+
   runApp(const MyApp());
+}
+
+@pragma('vm:entry-point')
+void onStart(ServiceInstance service) {
+  Geolocator.getPositionStream().listen((position) async {
+    final user = FirebaseAuth.instance.currentUser;
+    if (user == null) return;
+
+    final ref = FirebaseDatabase.instance.ref("bus_location/${user.uid}");
+
+    final snapshot = await ref.get();
+
+    //Only update if trip is running
+    if (!snapshot.exists || snapshot.child("status").value != "Running") {
+      return;
+    }
+
+    await ref.update({
+      "latitude": position.latitude,
+      "longitude": position.longitude,
+      "time": DateTime.now().toIso8601String(),
+    });
+  });
 }
 
 class MyApp extends StatelessWidget {
@@ -36,31 +75,68 @@ class LoginScreen extends StatefulWidget {
 class _LoginScreenState extends State<LoginScreen> {
   final TextEditingController idController = TextEditingController();
   final TextEditingController passwordController = TextEditingController();
-
+  bool isLoading = false;
   String errorText = '';
 
-  void login() {
-    String id = idController.text.trim();
-    String pass = passwordController.text.trim();
+  Future<void> login() async {
+    setState(() {
+      isLoading = true;
+    });
 
-    if (id == "student1" && pass == "1234") {
-      Navigator.push(
-        context,
-        MaterialPageRoute(builder: (_) => const StudentHome()),
+    try {
+      final user = await AuthService().login(
+        idController.text.trim(),
+        passwordController.text.trim(),
       );
-    } else if (id == "driver1" && pass == "1234") {
-      Navigator.push(
+
+      if (user == null) {
+        throw Exception("Login failed");
+      }
+
+      final snapshot = await FirebaseDatabase.instance
+          .ref("users/${user.uid}")
+          .get();
+
+      if (!snapshot.exists) {
+        throw Exception("User data not found");
+      }
+
+      String role = snapshot.child("role").value.toString();
+
+      if (!mounted) return;
+
+      if (role == "student") {
+        Navigator.pushReplacement(
+          context,
+          MaterialPageRoute(builder: (_) => const StudentHome()),
+        );
+      } else if (role == "driver") {
+        Navigator.pushReplacement(
+          context,
+          MaterialPageRoute(builder: (_) => const DriverHome()),
+        );
+      }
+    } catch (e) {
+      String message = "Login failed";
+
+      if (e is FirebaseAuthException) {
+        if (e.code == 'user-not-found') {
+          message = "No user found";
+        } else if (e.code == 'wrong-password') {
+          message = "Wrong password";
+        }
+      }
+
+      ScaffoldMessenger.of(
         context,
-        MaterialPageRoute(builder: (_) => const DriverHome()),
-      );
-    } else if (id == "admin1" && pass == "1234") {
-      Navigator.push(
-        context,
-        MaterialPageRoute(builder: (_) => const AdminHome()),
-      );
-    } else {
+      ).showSnackBar(SnackBar(content: Text(message)));
+
       setState(() {
-        errorText = "Invalid ID or Password";
+        errorText = message;
+      });
+    } finally {
+      setState(() {
+        isLoading = false;
       });
     }
   }
@@ -105,7 +181,12 @@ class _LoginScreenState extends State<LoginScreen> {
               ),
             ),
             const SizedBox(height: 30),
-            ElevatedButton(onPressed: login, child: const Text("Login")),
+            ElevatedButton(
+              onPressed: isLoading ? null : login,
+              child: isLoading
+                  ? const CircularProgressIndicator(color: Colors.white)
+                  : const Text("Login"),
+            ),
             const SizedBox(height: 15),
             Text(errorText, style: const TextStyle(color: Colors.red)),
           ],
@@ -123,68 +204,72 @@ class StudentHome extends StatefulWidget {
 }
 
 class _StudentHomeState extends State<StudentHome> {
-  final DatabaseReference dbRef = FirebaseDatabase.instance.ref("bus_location");
   GoogleMapController? mapController;
-  LatLng busPosition = const LatLng(
-    25.343298,
-    81.897551,
-  ); // Initial camera target
+  List<Map<String, dynamic>> busList = [];
+  LatLng? busPosition;
   Set<Marker> markers = {};
   Set<Polyline> polylines = {};
   LatLng? previousPosition;
   String etaText = "Waiting for bus...";
   String busStatus = "Waiting...";
   BitmapDescriptor? busIcon;
-
   @override
   void initState() {
     super.initState();
-    BitmapDescriptor.fromAssetImage(
-      const ImageConfiguration(size: Size(48, 48)),
-      'assets/bus_icon.png',
-    ).then((icon) {
-      busIcon = icon;
-    });
-    drawRoute();
+
+    loadBusIcon();
     listenBusLocation();
   }
 
-  void drawRoute() {
-    polylines.add(
-      const Polyline(
-        polylineId: PolylineId("route"),
-        width: 5,
-        color: Colors.blue,
-        points: [
-          LatLng(25.3400, 81.8900),
-          LatLng(25.3432, 81.8975),
-          LatLng(25.3450, 81.9000),
-        ],
-      ),
+  Future<void> loadBusIcon() async {
+    busIcon = await BitmapDescriptor.asset(
+      const ImageConfiguration(size: Size(48, 48)),
+      'assets/bus_icon.png',
     );
+
+    setState(() {}); // refresh UI after loading icon
   }
 
-  void calculateETA(LatLng busPos) {
-    // UPDATED STUDENT LOCATION COORDINATES
-    double studentLat = 25.343298359677494;
-    double studentLng = 81.89755136416476;
+  Future<void> calculateETA(LatLng busPos) async {
+    try {
+      // 1. Check location permission
+      LocationPermission permission = await Geolocator.checkPermission();
 
-    double distance = Geolocator.distanceBetween(
-      busPos.latitude,
-      busPos.longitude,
-      studentLat,
-      studentLng,
-    );
+      if (permission == LocationPermission.denied) {
+        permission = await Geolocator.requestPermission();
+      }
 
-    double speed = 15; // Average speed in m/s
-    double timeSeconds = distance / speed;
-    int minutes = (timeSeconds / 60).round();
+      if (permission == LocationPermission.deniedForever) {
+        debugPrint("Location permissions are permanently denied");
+        return;
+      }
 
-    setState(() {
-      etaText = distance < 50
-          ? "Bus is at your stop!"
-          : "Bus arriving in $minutes minutes";
-    });
+      // 2. Get current position
+      Position position = await Geolocator.getCurrentPosition(
+        desiredAccuracy: LocationAccuracy.high,
+      );
+
+      double studentLat = position.latitude;
+      double studentLng = position.longitude;
+
+      // 3. Calculate distance (in meters)
+      double distance = Geolocator.distanceBetween(
+        busPos.latitude,
+        busPos.longitude,
+        studentLat,
+        studentLng,
+      );
+
+      // 4. Convert distance to ETA (assume avg speed = 30 km/h)
+      double speed = 30 * 1000 / 3600; // m/s
+      double timeInSeconds = distance / speed;
+      double timeInMinutes = timeInSeconds / 60;
+
+      debugPrint("Distance: ${distance.toStringAsFixed(2)} meters");
+      debugPrint("ETA: ${timeInMinutes.toStringAsFixed(2)} minutes");
+    } catch (e) {
+      debugPrint("Error calculating ETA: $e");
+    }
   }
 
   void animateBus(LatLng newPosition) {
@@ -220,19 +305,48 @@ class _StudentHomeState extends State<StudentHome> {
   }
 
   void listenBusLocation() {
-    dbRef.onValue.listen((event) {
+    FirebaseDatabase.instance.ref("bus_location").onValue.listen((event) {
       if (!event.snapshot.exists) return;
-      Map data = Map<String, dynamic>.from(event.snapshot.value as Map);
-      double lat = data["latitude"];
-      double lng = data["longitude"];
-      String status = data["status"] ?? "Unknown";
 
-      LatLng newPosition = LatLng(lat, lng);
-      animateBus(newPosition);
-      calculateETA(newPosition);
+      Map data = Map<String, dynamic>.from(event.snapshot.value as Map);
+
+      Set<Marker> newMarkers = {};
+      List<Map<String, dynamic>> tempList = [];
+
+      for (var driverId in data.keys) {
+        var busData = data[driverId];
+
+        if (busData == null || busData is! Map) continue;
+
+        String status = (busData["status"] ?? "").toString();
+        if (status.toLowerCase() != "running") continue;
+
+        double lat = (busData["latitude"] ?? 0).toDouble();
+        double lng = (busData["longitude"] ?? 0).toDouble();
+        String name = busData["driverName"] ?? "Driver";
+
+        LatLng position = LatLng(lat, lng);
+
+        newMarkers.add(
+          Marker(
+            markerId: MarkerId(driverId),
+            position: position,
+            infoWindow: InfoWindow(title: name, snippet: "Status: $status"),
+          ),
+        );
+
+        tempList.add({
+          "driverId": driverId,
+          "name": name,
+          "lat": lat,
+          "lng": lng,
+          "status": status,
+        });
+      }
 
       setState(() {
-        busStatus = status;
+        markers = newMarkers;
+        busList = tempList;
       });
     });
   }
@@ -240,68 +354,104 @@ class _StudentHomeState extends State<StudentHome> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(
-        title: const Text("Student Bus Tracker"),
-        actions: [
-          IconButton(
-            icon: const Icon(Icons.qr_code_scanner),
-            onPressed: () {
-              Navigator.push(
-                context,
-                MaterialPageRoute(builder: (_) => const StudentQRScanner()),
-              );
-            },
-          ),
-        ],
+      appBar: AppBar(title: const Text("Live Bus Tracker")),
+
+      // ✅ Move FAB here (correct place)
+      floatingActionButton: FloatingActionButton(
+        onPressed: () {
+          Navigator.push(
+            context,
+            MaterialPageRoute(builder: (_) => const StudentQRScanner()),
+          );
+        },
+        child: const Icon(Icons.qr_code_scanner),
       ),
+
       body: Stack(
         children: [
+          // 🔥 GOOGLE MAP
           GoogleMap(
             initialCameraPosition: CameraPosition(
-              target: busPosition,
+              target: busPosition ?? const LatLng(20.5937, 78.9629),
               zoom: 15,
             ),
             markers: markers,
-            polylines: polylines,
             myLocationEnabled: true,
+            myLocationButtonEnabled: true,
             onMapCreated: (controller) {
               mapController = controller;
             },
           ),
-          Positioned(
-            top: 20,
-            left: 20,
-            right: 20,
-            child: Container(
-              padding: const EdgeInsets.all(12),
-              decoration: BoxDecoration(
-                color: Colors.black87,
-                borderRadius: BorderRadius.circular(10),
-              ),
-              child: Text(
-                etaText,
-                textAlign: TextAlign.center,
-                style: const TextStyle(color: Colors.white, fontSize: 16),
-              ),
-            ),
-          ),
-          Positioned(
-            top: 80,
-            left: 20,
-            right: 20,
-            child: Container(
-              padding: const EdgeInsets.all(10),
-              decoration: BoxDecoration(
-                color: Colors.green,
-                borderRadius: BorderRadius.circular(10),
-              ),
-              child: Text(
-                "Bus Status: $busStatus",
-                textAlign: TextAlign.center,
-                style: const TextStyle(color: Colors.white, fontSize: 16),
-              ),
-            ),
-          ),
+
+          // 🔥 CONDITIONAL UI (NO EMPTY SHEET)
+          busList.isEmpty
+              ? Positioned(
+                  bottom: 20,
+                  left: 20,
+                  right: 20,
+                  child: Container(
+                    padding: const EdgeInsets.all(12),
+                    decoration: BoxDecoration(
+                      color: Colors.white,
+                      borderRadius: BorderRadius.circular(12),
+                      boxShadow: const [
+                        BoxShadow(color: Colors.black26, blurRadius: 5),
+                      ],
+                    ),
+                    child: const Center(
+                      child: Text(
+                        "No buses running 🚫",
+                        style: TextStyle(fontSize: 16),
+                      ),
+                    ),
+                  ),
+                )
+              // BUS LIST SHEET
+              : DraggableScrollableSheet(
+                  initialChildSize: 0.2,
+                  minChildSize: 0.1,
+                  maxChildSize: 0.5,
+                  builder: (context, scrollController) {
+                    return Container(
+                      decoration: const BoxDecoration(
+                        color: Colors.white,
+                        borderRadius: BorderRadius.vertical(
+                          top: Radius.circular(20),
+                        ),
+                      ),
+                      child: ListView.builder(
+                        controller: scrollController,
+                        itemCount: busList.length,
+                        itemBuilder: (context, index) {
+                          var bus = busList[index];
+
+                          return ListTile(
+                            leading: const Icon(
+                              Icons.directions_bus,
+                              color: Colors.blue,
+                            ),
+                            title: Text(bus["name"] ?? "Driver"),
+                            subtitle: Text(
+                              "Status: ${bus["status"]}",
+                              style: TextStyle(
+                                color: bus["status"] == "Running"
+                                    ? Colors.green
+                                    : Colors.red,
+                              ),
+                            ),
+                            onTap: () {
+                              LatLng selected = LatLng(bus["lat"], bus["lng"]);
+
+                              mapController?.animateCamera(
+                                CameraUpdate.newLatLngZoom(selected, 17),
+                              );
+                            },
+                          );
+                        },
+                      ),
+                    );
+                  },
+                ),
         ],
       ),
     );
@@ -310,6 +460,7 @@ class _StudentHomeState extends State<StudentHome> {
 
 class DriverHome extends StatefulWidget {
   const DriverHome({super.key});
+
   @override
   State<DriverHome> createState() => _DriverHomeState();
 }
@@ -319,77 +470,127 @@ class _DriverHomeState extends State<DriverHome> {
   double totalDistance = 0;
   Position? previousPosition;
   double fuelAverage = 0;
+  String tripStatusText = "Trip Stopped";
+  DateTime? lastUpdate;
+
   StreamSubscription<Position>? positionStream;
   GoogleMapController? mapController;
-  LatLng currentPosition = const LatLng(25.343298, 81.897551);
+
+  LatLng? currentPosition;
   Set<Marker> markers = {};
-  final DatabaseReference dbRef = FirebaseDatabase.instance.ref("bus_location");
 
   Future<void> startTrip() async {
     if (tripRunning) return;
 
+    final user = FirebaseAuth.instance.currentUser;
+    if (user == null) return;
+
+    final String driverId = user.uid;
+
+    // Get driver name
+    final userSnapshot = await FirebaseDatabase.instance
+        .ref("users/$driverId")
+        .get();
+
+    String driverName =
+        userSnapshot.child("name").value?.toString() ?? "Driver";
+
+    // Permission
     LocationPermission permission = await Geolocator.requestPermission();
     if (permission == LocationPermission.denied ||
         permission == LocationPermission.deniedForever) {
       return;
     }
 
+    // Background service
     final service = FlutterBackgroundService();
-    service.startService();
+    await service.startService();
 
+    await FirebaseDatabase.instance.ref("bus_location/$driverId").update({
+      "status": "Running",
+      "time": DateTime.now().toIso8601String(),
+    });
     setState(() {
       tripRunning = true;
+      tripStatusText = "🟢 Trip Started";
     });
 
     positionStream =
         Geolocator.getPositionStream(
           locationSettings: const LocationSettings(
             accuracy: LocationAccuracy.best,
-            distanceFilter: 1,
+            distanceFilter: 10,
           ),
-        ).listen((Position position) {
-          LatLng newPosition = LatLng(position.latitude, position.longitude);
+        ).listen((Position position) async {
+          //  THROTTLE
+          if (lastUpdate == null ||
+              DateTime.now().difference(lastUpdate!) >
+                  const Duration(seconds: 2)) {
+            lastUpdate = DateTime.now();
 
-          if (previousPosition != null) {
-            double distance = Geolocator.distanceBetween(
-              previousPosition!.latitude,
-              previousPosition!.longitude,
+            final LatLng newPosition = LatLng(
               position.latitude,
               position.longitude,
             );
-            totalDistance += distance;
-            double fuelUsed = totalDistance / 10000; // Mock calculation
-            fuelAverage =
-                (totalDistance / 1000) / (fuelUsed == 0 ? 1 : fuelUsed);
+
+            setState(() {
+              currentPosition = newPosition;
+            });
+
+            //  Distance calculation (MOVE INSIDE)
+            if (previousPosition != null) {
+              double distance = Geolocator.distanceBetween(
+                previousPosition!.latitude,
+                previousPosition!.longitude,
+                position.latitude,
+                position.longitude,
+              );
+
+              totalDistance += distance;
+            }
+
+            previousPosition = position;
+
+            try {
+              await FirebaseDatabase.instance
+                  .ref("bus_location/$driverId")
+                  .update({
+                    "latitude": position.latitude,
+                    "longitude": position.longitude,
+                    "driverName": driverName,
+                    "time": DateTime.now().toIso8601String(),
+                    "distance": totalDistance,
+                  });
+            } catch (e) {
+              debugPrint("Firebase error: $e");
+            }
           }
 
-          previousPosition = position;
+          //UI UPDATE (ALWAYS FAST)
           setState(() {
-            currentPosition = newPosition;
-            markers = {
-              Marker(markerId: const MarkerId("bus"), position: newPosition),
-            };
+            currentPosition = LatLng(position.latitude, position.longitude);
           });
-
-          dbRef.set({
-            "latitude": position.latitude,
-            "longitude": position.longitude,
-            "distance": totalDistance,
-            "fuelAverage": fuelAverage,
-            "status": "Running",
-            "time": DateTime.now().toIso8601String(),
-          });
-
-          mapController?.animateCamera(CameraUpdate.newLatLng(newPosition));
         });
   }
 
-  void stopTrip() {
+  //  STOP TRIP
+  Future<void> stopTrip() async {
     positionStream?.cancel();
     positionStream = null;
-    dbRef.update({"status": "Stopped"});
+
+    final user = FirebaseAuth.instance.currentUser;
+    if (user == null) return;
+
+    String driverId = user.uid;
+
+    await FirebaseDatabase.instance.ref("bus_location/$driverId").update({
+      "status": "Stopped",
+      "time": DateTime.now().toIso8601String(),
+    });
+
     setState(() {
       tripRunning = false;
+      tripStatusText = "🔴 Trip Stopped";
     });
   }
 
@@ -403,17 +604,54 @@ class _DriverHomeState extends State<DriverHome> {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(title: const Text("Driver Map Panel")),
-      body: GoogleMap(
-        initialCameraPosition: CameraPosition(
-          target: currentPosition,
-          zoom: 15,
-        ),
-        markers: markers,
-        myLocationEnabled: true,
-        onMapCreated: (controller) {
-          mapController = controller;
-        },
+
+      body: Stack(
+        children: [
+          // 🔥 GOOGLE MAP
+          GoogleMap(
+            initialCameraPosition: CameraPosition(
+              target: currentPosition ?? const LatLng(20.5937, 78.9629),
+              zoom: 15,
+            ),
+            markers: markers,
+            myLocationEnabled: true,
+            onMapCreated: (controller) {
+              mapController = controller;
+            },
+          ),
+
+          // 🔥 TRIP STATUS TEXT
+          Positioned(
+            top: 20,
+            left: 20,
+            right: 20,
+            child: Container(
+              padding: const EdgeInsets.all(12),
+              decoration: BoxDecoration(
+                color: tripRunning
+                    ? Colors.green.withValues(alpha: 0.9)
+                    : Colors.red.withValues(alpha: 0.9),
+                borderRadius: BorderRadius.circular(10),
+                boxShadow: const [
+                  BoxShadow(color: Colors.black26, blurRadius: 5),
+                ],
+              ),
+              child: Center(
+                child: Text(
+                  tripStatusText,
+                  style: const TextStyle(
+                    fontSize: 16,
+                    fontWeight: FontWeight.bold,
+                    color: Colors.white,
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ],
       ),
+
+      // 🔥 BUTTONS
       floatingActionButton: Column(
         mainAxisAlignment: MainAxisAlignment.end,
         children: [
@@ -424,6 +662,7 @@ class _DriverHomeState extends State<DriverHome> {
             child: const Icon(Icons.play_arrow),
           ),
           const SizedBox(height: 15),
+
           FloatingActionButton(
             heroTag: "stop",
             backgroundColor: Colors.red,
@@ -431,6 +670,7 @@ class _DriverHomeState extends State<DriverHome> {
             child: const Icon(Icons.stop),
           ),
           const SizedBox(height: 15),
+
           FloatingActionButton(
             heroTag: "qr",
             backgroundColor: Colors.blue,
@@ -452,6 +692,7 @@ class _DriverHomeState extends State<DriverHome> {
 
 class AdminHome extends StatefulWidget {
   const AdminHome({super.key});
+
   @override
   State<AdminHome> createState() => _AdminHomeState();
 }
@@ -460,6 +701,7 @@ class _AdminHomeState extends State<AdminHome> {
   final DatabaseReference attendanceRef = FirebaseDatabase.instance.ref(
     "attendance",
   );
+
   List attendanceList = [];
 
   @override
@@ -471,11 +713,14 @@ class _AdminHomeState extends State<AdminHome> {
   void loadAttendance() {
     attendanceRef.onValue.listen((event) {
       if (!event.snapshot.exists) return;
+
       Map data = Map<String, dynamic>.from(event.snapshot.value as Map);
+
       List temp = [];
       data.forEach((key, value) {
         temp.add(value);
       });
+
       setState(() {
         attendanceList = temp;
       });
@@ -486,32 +731,130 @@ class _AdminHomeState extends State<AdminHome> {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(title: const Text("Admin Panel")),
-      body: attendanceList.isEmpty
-          ? const Center(
-              child: Text(
-                "No Attendance Records Yet",
-                style: TextStyle(fontSize: 18),
-              ),
-            )
-          : ListView.builder(
-              itemCount: attendanceList.length,
-              itemBuilder: (context, index) {
-                var record = attendanceList[index];
-                return Card(
-                  margin: const EdgeInsets.all(10),
-                  child: ListTile(
-                    title: Text("Student: ${record["studentId"]}"),
-                    subtitle: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Text("Trip: ${record["tripId"]}"),
-                        Text("Time: ${record["time"]}"),
-                      ],
-                    ),
-                  ),
+
+      body: Column(
+        children: [
+          // 🔥 CREATE USER BUTTON
+          Padding(
+            padding: const EdgeInsets.all(10),
+            child: ElevatedButton(
+              onPressed: () {
+                showDialog(
+                  context: context,
+                  builder: (_) => CreateUserDialog(),
                 );
               },
+              child: const Text("➕ Create User"),
             ),
+          ),
+
+          // 🔥 ATTENDANCE LIST
+          Expanded(
+            child: attendanceList.isEmpty
+                ? const Center(
+                    child: Text(
+                      "No Attendance Records Yet",
+                      style: TextStyle(fontSize: 18),
+                    ),
+                  )
+                : ListView.builder(
+                    itemCount: attendanceList.length,
+                    itemBuilder: (context, index) {
+                      var record = attendanceList[index];
+
+                      return Card(
+                        margin: const EdgeInsets.all(10),
+                        child: ListTile(
+                          leading: const Icon(Icons.person),
+                          title: Text("Student: ${record["studentId"]}"),
+                          subtitle: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text("Trip: ${record["tripId"]}"),
+                              Text("Time: ${record["time"]}"),
+                            ],
+                          ),
+                        ),
+                      );
+                    },
+                  ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class CreateUserDialog extends StatefulWidget {
+  const CreateUserDialog({super.key});
+
+  @override
+  State<CreateUserDialog> createState() => _CreateUserDialogState();
+}
+
+class _CreateUserDialogState extends State<CreateUserDialog> {
+  final emailController = TextEditingController();
+  final passwordController = TextEditingController();
+  final nameController = TextEditingController();
+
+  String role = "student";
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: const Text("Create User"),
+
+      content: SingleChildScrollView(
+        child: Column(
+          children: [
+            TextField(
+              controller: nameController,
+              decoration: const InputDecoration(labelText: "Name"),
+            ),
+            TextField(
+              controller: emailController,
+              decoration: const InputDecoration(labelText: "Email"),
+            ),
+            TextField(
+              controller: passwordController,
+              decoration: const InputDecoration(labelText: "Password"),
+              obscureText: true,
+            ),
+
+            const SizedBox(height: 10),
+
+            DropdownButtonFormField<String>(
+              initialValue: role,
+              items: [
+                "student",
+                "driver",
+              ].map((e) => DropdownMenuItem(value: e, child: Text(e))).toList(),
+              onChanged: (val) {
+                setState(() {
+                  role = val!;
+                });
+              },
+              decoration: const InputDecoration(labelText: "Role"),
+            ),
+          ],
+        ),
+      ),
+
+      actions: [
+        ElevatedButton(
+          onPressed: () async {
+            final navigator = Navigator.of(context);
+            await AuthService().createUserByAdmin(
+              emailController.text.trim(),
+              passwordController.text.trim(),
+              role,
+              nameController.text.trim(),
+            );
+            navigator.pop();
+          },
+          child: const Text("Create"),
+        ),
+      ],
     );
   }
 }
